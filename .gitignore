@@ -1,0 +1,14 @@
+# Titkos adatok - soha ne kerüljenek a tárolóba
+secrets.yaml
+*.secret
+.wu_apikey
+apikey
+*.key
+.env
+
+# Generált fájlok
+__pycache__/
+*.pyc
+.esphome/
+*.csv
+eredmeny/
