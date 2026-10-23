@@ -1,0 +1,94 @@
+# Home Assistant csomag: időjárás-alapú öntözés (szakdolgozat 6.5 és 8.3)
+# Helye: /config/packages/ontozes.yaml
+# A configuration.yaml-ben:  homeassistant:  packages: !include_dir_named packages
+# Az ontozes.py helye: /config/scripts/ontozes.py
+#
+# Működés: minden délután, az esti zónák előtt lefut a vízmérleg-számítás.
+#  - ha öntözni kell: a gyepzónák (1. és 4.) időtartamát a számított percekre állítja, és engedélyezi őket
+#  - ha nem kell (nincs elég vízhiány, vagy eső várható): a két gyepzónát kikapcsolja aznapra
+#  - ha a számítás hibával áll le: visszaáll a fix időzítésre (15 és 30 perc), és értesítést küld
+# A csepegtetett zónák (2., 3., 5., 6.) a vezérlő saját, fix időzítésén maradnak.
+#
+# Az entitásnevek az ESPHome-eszköz nevéből (Ontozo Rendszer) képződnek;
+# a saját rendszerben a Beállítások > Eszközök oldalon ellenőrizendők.
+
+shell_command:
+  ontozes_dontes: "python3 /config/scripts/ontozes.py today"
+
+automation:
+  - id: ontozes_napi_dontes
+    alias: "Öntözés – napi döntés a vízmérleg alapján"
+    description: "Az ontozes.py kiszámolja a gyepzónák mai öntözési idejét (FAO-56 vízmérleg)."
+    mode: single
+    triggers:
+      - trigger: time
+        at: "16:30:00"
+    actions:
+      - action: shell_command.ontozes_dontes
+        response_variable: valasz
+
+      # Hiba esetén vissza a fix időzítésre
+      - if:
+          - condition: template
+            value_template: "{{ valasz['returncode'] != 0 }}"
+        then:
+          - action: number.set_value
+            target:
+              entity_id: number.ontozo_rendszer_zone_1_duration
+            data:
+              value: 15
+          - action: number.set_value
+            target:
+              entity_id: number.ontozo_rendszer_zone_4_duration
+            data:
+              value: 30
+          - action: switch.turn_on
+            target:
+              entity_id:
+                - switch.ontozo_rendszer_zone_1_enabled
+                - switch.ontozo_rendszer_zone_4_enabled
+          - action: persistent_notification.create
+            data:
+              title: "Öntözés"
+              message: >-
+                A vízmérleg-számítás nem futott le, ma a fix időzítés érvényes.
+                Hiba: {{ valasz['stderr'] | truncate(200) }}
+          - stop: "A számítás hibával állt le"
+
+      - variables:
+          dontes: "{{ valasz['stdout'] | from_json }}"
+
+      - if:
+          - condition: template
+            value_template: "{{ dontes.ontozes_mm | float(0) > 0 }}"
+        then:
+          - action: number.set_value
+            target:
+              entity_id: number.ontozo_rendszer_zone_1_duration
+            data:
+              value: "{{ dontes.percek['1'] }}"
+          - action: number.set_value
+            target:
+              entity_id: number.ontozo_rendszer_zone_4_duration
+            data:
+              value: "{{ dontes.percek['4'] }}"
+          - action: switch.turn_on
+            target:
+              entity_id:
+                - switch.ontozo_rendszer_zone_1_enabled
+                - switch.ontozo_rendszer_zone_4_enabled
+        else:
+          # Nem nullára állítjuk az időt, hanem kikapcsoljuk a zónát
+          # (a régi vezérlőprogram 0 perces zónát másodpercenként újraindítana).
+          - action: switch.turn_off
+            target:
+              entity_id:
+                - switch.ontozo_rendszer_zone_1_enabled
+                - switch.ontozo_rendszer_zone_4_enabled
+
+      - action: logbook.log
+        data:
+          name: "Öntözés"
+          message: >-
+            {{ dontes.indok }}: hiány {{ dontes.hiany_mm }} mm, várható eső {{ dontes.varhato_eso_mm }} mm,
+            öntözés {{ dontes.ontozes_mm }} mm ({{ dontes.percek['1'] }} perc zónánként)

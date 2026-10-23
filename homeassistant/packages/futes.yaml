@@ -1,0 +1,148 @@
+# Home Assistant csomag: "Ha süt a nap, ne induljon a fűtés" (szakdolgozat 8.1)
+# Helye: /config/packages/futes.yaml
+# A configuration.yaml-ben:  homeassistant:  packages: !include_dir_named packages
+#
+# Működés (csak a déli szobára, mert az északi szoba nem kap napnyereséget, 7.2):
+#  - reggel 6:00-kor, a szokásos fűtésindításkor megnézi a napelemes termelés
+#    aznapi előrejelzését (Forecast.Solar). Ha napos nap várható, és a szoba
+#    nem hideg, a fűtés indulása délig elmarad.
+#  - komfortkorlát: ha a szoba a halasztás alatt 19 °C alá hűl, a fűtés azonnal indul.
+#  - délben a halasztás véget ér; ha a nap nem melegítette fel a szobát, a fűtés indul.
+#  - tartalékszabály: ha az előrejelzés nem elérhető vagy 3 óránál régebbi,
+#    a fűtés a szokásos módon indul (5.3).
+#
+# Az entitásnevek HELYETTESÍTENDŐK a saját rendszer neveivel
+# (Beállítások > Eszközök és szolgáltatások > Entitások):
+#   sensor.energy_production_today   Forecast.Solar: "Estimated energy production - today" (kWh)
+#   sensor.deli_szoba_homerseklet    a déli szoba BLE-hőmérője
+#   climate.deli_szoba_klima         a déli szoba klímája (fűtés üzemmód)
+
+input_number:
+  napos_nap_kuszob:
+    name: "Napos nap küszöbe (előrejelzett napi termelés)"
+    min: 0
+    max: 60
+    step: 1
+    unit_of_measurement: "kWh"
+    initial: 12            # téli próbaüzem alapján hangolandó
+  futes_celhomerseklet:
+    name: "Déli szoba célhőmérséklete"
+    min: 18
+    max: 24
+    step: 0.5
+    unit_of_measurement: "°C"
+    initial: 21
+
+input_boolean:
+  futes_halasztva:
+    name: "Déli szoba: fűtés napsütés miatt halasztva"
+  futesi_ideny:
+    # csak fűtési idényben fűt és dönt (nyáron a klímát nem állítja fűtésre);
+    # a ha_hoforras.yaml (8.5) is ezt használja
+    name: "Fűtési idény"
+
+automation:
+  - id: futes_napos_reggel
+    alias: "Fűtés – reggeli döntés napsütés-előrejelzéssel"
+    mode: single
+    triggers:
+      - trigger: time
+        at: "06:00:00"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.futesi_ideny
+        state: "on"
+    variables:
+      elorejelzes: "{{ states('sensor.energy_production_today') }}"
+      friss: >-
+        {{ elorejelzes | is_number and
+           (now() - states.sensor.energy_production_today.last_updated).total_seconds() < 3 * 3600 }}
+      szoba: "{{ states('sensor.deli_szoba_homerseklet') | float(0) }}"
+    actions:
+      - if:
+          - condition: template
+            value_template: >-
+              {{ friss and elorejelzes | float(0) >= states('input_number.napos_nap_kuszob') | float(999)
+                 and szoba >= 19.5 }}
+        then:
+          - action: input_boolean.turn_on
+            target:
+              entity_id: input_boolean.futes_halasztva
+          - action: logbook.log
+            data:
+              name: "Fűtés"
+              message: >-
+                Napos nap várható ({{ elorejelzes }} kWh), a szoba {{ szoba }} °C:
+                a fűtés délig halasztva.
+        else:
+          - action: climate.set_temperature
+            target:
+              entity_id: climate.deli_szoba_klima
+            data:
+              hvac_mode: heat
+              temperature: "{{ states('input_number.futes_celhomerseklet') | float(21) }}"
+          - action: logbook.log
+            data:
+              name: "Fűtés"
+              message: >-
+                Szokásos fűtésindítás (előrejelzés: {{ elorejelzes }} kWh,
+                {{ 'friss' if friss else 'nem elérhető vagy elavult' }}).
+
+  - id: futes_komfortkorlat
+    alias: "Fűtés – komfortkorlát a halasztás alatt"
+    mode: single
+    triggers:
+      - trigger: numeric_state
+        entity_id: sensor.deli_szoba_homerseklet
+        below: 19
+    conditions:
+      - condition: state
+        entity_id: input_boolean.futes_halasztva
+        state: "on"
+    actions:
+      - action: climate.set_temperature
+        target:
+          entity_id: climate.deli_szoba_klima
+        data:
+          hvac_mode: heat
+          temperature: "{{ states('input_number.futes_celhomerseklet') | float(21) }}"
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.futes_halasztva
+      - action: logbook.log
+        data:
+          name: "Fűtés"
+          message: "A szoba 19 °C alá hűlt, a fűtés a halasztás ellenére indul."
+
+  - id: futes_halasztas_vege
+    alias: "Fűtés – a halasztás vége délben"
+    mode: single
+    triggers:
+      - trigger: time
+        at: "12:00:00"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.futes_halasztva
+        state: "on"
+    actions:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.futes_halasztva
+      - if:
+          - condition: numeric_state
+            entity_id: sensor.deli_szoba_homerseklet
+            below: 20.5
+        then:
+          - action: climate.set_temperature
+            target:
+              entity_id: climate.deli_szoba_klima
+            data:
+              hvac_mode: heat
+              temperature: "{{ states('input_number.futes_celhomerseklet') | float(21) }}"
+      - action: logbook.log
+        data:
+          name: "Fűtés"
+          message: >-
+            Halasztás vége, a szoba {{ states('sensor.deli_szoba_homerseklet') }} °C
+            ({{ 'fűtés indul' if states('sensor.deli_szoba_homerseklet') | float(0) < 20.5
+                else 'a nap felmelegítette, fűtés nem kell' }}).

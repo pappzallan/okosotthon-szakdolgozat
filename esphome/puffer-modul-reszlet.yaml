@@ -1,0 +1,49 @@
+# Javasolt módosítás (szemléltető, próbapadon tesztelendő)
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    password: !secret puffer_ap_password  # tartalék hozzáférési pont
+
+api:
+  encryption:
+    key: !secret puffer_api_key
+  reboot_timeout: 0s              # a helyi logikához nem kell kapcsolódó kliens
+
+ota:
+  - platform: esphome
+    password: !secret puffer_ota_password
+
+web_server:
+  port: 80
+  auth:                           # a webfelület jelszót kér
+    username: !secret web_user
+    password: !secret web_password
+
+sensor:
+  - platform: dallas_temp
+    address: 0x220114483a6baa28
+    name: S01
+    id: s01
+    update_interval: 10s          # az on_value_range blokk törölve
+
+switch:
+  - platform: gpio
+    pin: GPIO05
+    id: Rele1
+    name: "Kazan rele"
+    restore_mode: ALWAYS_ON       # biztonságos irány: induláskor a szivattyú jár
+
+interval:
+  - interval: 10s                 # minden mérésnél újra dönt, nem csak átlépéskor
+    then:
+      - if:
+          condition:
+            lambda: 'return isnan(id(s01).state) || id(s01).state > 55.0;'
+          then:
+            - switch.turn_on: Rele1     # érzékelőhiba esetén is bekapcsol
+      - if:
+          condition:
+            lambda: 'return id(s01).state < 50.0;'
+          then:
+            - switch.turn_off: Rele1

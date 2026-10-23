@@ -1,0 +1,160 @@
+# Home Assistant csomag: költségalapú hőforrás-választás (szakdolgozat 8.5)
+# Helye: /config/packages/hoforras.yaml   A program: /config/scripts/hoforras.py
+#
+# Működés:
+#  - két közüzemi mérő (utility_meter) augusztus 1-jétől összegzi a hálózatból
+#    vételezett és a betáplált energiát (az elszámolási év aug. 1. – júl. 31.);
+#  - óránként lefut a hoforras.py, megkapja a pillanatnyi állapotot, és visszaadja
+#    a legolcsóbb, automatikusan kapcsolható hőforrást;
+#  - a döntés egy választómezőbe kerül (input_select.hoforras); a tényleges
+#    eszközkapcsolást külön automatizmus végzi, így a döntés és a végrehajtás
+#    elválik, és a döntés kézzel is felülírható;
+#  - ha a tűzifa a legolcsóbb, értesítést küld (a kazánt kézzel kell begyújtani);
+#  - ha a program hibával áll le, a választás nem változik (tartalékszabály, 5.3);
+#  - csak fűtési idényben működik (input_boolean.futesi_ideny), és nem írja felül
+#    a napsütés miatti halasztást (8.1). Mindkettőt a ha_futes.yaml csomag
+#    definiálja, ezért ez a csomag azzal együtt használandó.
+#
+# HELYETTESÍTENDŐ entitásnevek:
+#   sensor.p1_vetelezes_osszes    ADA P1: a hálózatból vételezett energia összesen (kWh)
+#   sensor.p1_betaplalas_osszes   ADA P1: a hálózatba betáplált energia összesen (kWh)
+#   sensor.p1_betaplalas_teljesitmeny  ADA P1: pillanatnyi betáplálás (W)
+#   sensor.kulso_homerseklet      a helyi időjárás-állomás (6.6) vagy előrejelzés
+#   sensor.puffer_felso           puffer-modul, S02
+#   climate.deli_szoba_klima, switch.radiator_*   a fűtőeszközök
+
+utility_meter:
+  halozat_vetelezes_ev:
+    source: sensor.p1_vetelezes_osszes
+    name: "Vételezés az elszámolási évben"
+    cron: "0 0 1 8 *"          # augusztus 1., 0:00
+  halozat_betaplalas_ev:
+    source: sensor.p1_betaplalas_osszes
+    name: "Betáplálás az elszámolási évben"
+    cron: "0 0 1 8 *"
+
+input_select:
+  hoforras:
+    name: "Aktív hőforrás"
+    options: [puffer, klima, radiator]
+    initial: klima
+
+input_number:
+  varhato_tovabbi_netto:
+    # az év hátralévő részének várható nettó fogyasztása (vételezés - betáplálás);
+    # az első évben az előző évi számlából, később a saját P1-adatokból becsülve
+    name: "Várható további nettó fogyasztás (júl. 31-ig)"
+    min: -10000
+    max: 20000
+    step: 50
+    unit_of_measurement: "kWh"
+
+shell_command:
+  hoforras_dontes: >-
+    python3 /config/scripts/hoforras.py most '{{ allapot | to_json }}'
+
+automation:
+  - id: hoforras_orankent
+    alias: "Hőforrás – óránkénti költségalapú döntés"
+    mode: single
+    triggers:
+      - trigger: time_pattern
+        minutes: 5
+    variables:
+      allapot:
+        elszamolas: "szaldo"        # bruttóra váltáskor "brutto"
+        netto_kwh_ev_eleje_ota: >-
+          {{ states('sensor.halozat_vetelezes_ev') | float(0)
+             - states('sensor.halozat_betaplalas_ev') | float(0) }}
+        varhato_tovabbi_kwh: "{{ states('input_number.varhato_tovabbi_netto') | float(0) }}"
+        kulso_c: "{{ states('sensor.kulso_homerseklet') | float(none) }}"
+        puffer_c: "{{ states('sensor.puffer_felso') | float(none) }}"
+        pv_tobblet_w: "{{ states('sensor.p1_betaplalas_teljesitmeny') | float(0) }}"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.futesi_ideny
+        state: "on"
+    actions:
+      - action: shell_command.hoforras_dontes
+        response_variable: valasz
+      - if:
+          - condition: template
+            value_template: "{{ valasz['returncode'] != 0 }}"
+        then:
+          - action: logbook.log
+            data:
+              name: "Hőforrás"
+              message: "A számítás hibával állt le, a hőforrás nem változik: {{ valasz['stderr'] | truncate(150) }}"
+          - stop: "hiba"
+      - variables:
+          dontes: "{{ valasz['stdout'] | from_json }}"
+      - if:
+          - condition: template
+            value_template: "{{ states('input_select.hoforras') != dontes.javaslat }}"
+        then:
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.hoforras
+            data:
+              option: "{{ dontes.javaslat }}"
+      - if:
+          - condition: template
+            value_template: "{{ dontes.befutes_javasolt }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              title: "Hőforrás"
+              notification_id: hoforras_fa
+              message: >-
+                Most a tűzifa a legolcsóbb ({{ dontes.hoar_ft_kwh.fa }} Ft/kWh hő,
+                a klíma {{ dontes.hoar_ft_kwh.klima }} Ft/kWh). Érdemes begyújtani.
+      - action: logbook.log
+        data:
+          name: "Hőforrás"
+          message: >-
+            {{ dontes.helyzet }} ({{ dontes.villanyar_ft_kwh }} Ft/kWh villany, COP {{ dontes.klima_cop }}):
+            {{ dontes.javaslat }}; sorrend: {{ dontes.sorrend | join(', ') }}
+
+  # Végrehajtás (példa): a választásnak megfelelő eszköz fűt, a többi pihen.
+  # A puffer fűtőkörének kapcsolása a saját gépészettől függ, ezért itt csak jelzés.
+  - id: hoforras_vegrehajtas
+    alias: "Hőforrás – a kiválasztott hőforrás bekapcsolása"
+    mode: restart
+    triggers:
+      - trigger: state
+        entity_id: input_select.hoforras
+    conditions:
+      - condition: state
+        entity_id: input_boolean.futesi_ideny
+        state: "on"
+      # a 8.1 napsütés miatti halasztását nem írja felül (ha az a csomag is fut)
+      - condition: template
+        value_template: "{{ not is_state('input_boolean.futes_halasztva', 'on') }}"
+    actions:
+      - choose:
+          - conditions: "{{ trigger.to_state.state == 'klima' }}"
+            sequence:
+              - action: switch.turn_off
+                target:
+                  entity_id: switch.radiator_deli_szoba
+              - action: climate.set_hvac_mode
+                target:
+                  entity_id: climate.deli_szoba_klima
+                data:
+                  hvac_mode: heat
+          - conditions: "{{ trigger.to_state.state == 'radiator' }}"
+            sequence:
+              - action: climate.set_hvac_mode
+                target:
+                  entity_id: climate.deli_szoba_klima
+                data:
+                  hvac_mode: "off"
+              - action: switch.turn_on
+                target:
+                  entity_id: switch.radiator_deli_szoba
+          - conditions: "{{ trigger.to_state.state == 'puffer' }}"
+            sequence:
+              - action: logbook.log
+                data:
+                  name: "Hőforrás"
+                  message: "A puffer elég meleg, a fűtőkör a pufferről működhet."
